@@ -9,6 +9,12 @@
 import { WebError } from '@deepseek-ai/dsh-web'
 import type { WebFetchProvider, WebFetchRequest, WebFetchResult } from '@deepseek-ai/dsh-web'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
+import {
+  FirecrawlApiKeyPool,
+  FirecrawlCredentialMissingError,
+  FirecrawlHttpError,
+  FirecrawlKeyPoolCooldownError,
+} from './key-pool.ts'
 import type { FirecrawlError, FirecrawlScrapeResponse } from './types.ts'
 
 /** Stable id this provider registers under. */
@@ -21,7 +27,7 @@ export const FIRECRAWL_DEFAULT_BASE_URL = 'https://api.firecrawl.dev/v2'
 export const FIRECRAWL_DEFAULT_MAX_CONTENT_CHARS = 100_000
 
 /** Attribution header sent on every request. Bump with the package version. */
-const USER_AGENT = 'deepseek-harness/0.0.1'
+const USER_AGENT = 'deepseek-harness-firecrawl/0.2.0'
 
 /** Resolved provider options (the plugin's `apply` supplies credential and constant defaults). */
 export interface FirecrawlFetchProviderOptions {
@@ -29,6 +35,8 @@ export interface FirecrawlFetchProviderOptions {
   apiKey?: string
   /** Resolve the current Firecrawl API key for one scrape operation. */
   resolveApiKey?: () => Promise<string | undefined>
+  /** Shared pool used by the plugin when multiple account references are configured. */
+  keyPool?: FirecrawlApiKeyPool
   /** Credential reference named by missing-credential diagnostics. */
   apiKeyEnv?: CredentialRef
   /** Endpoint base; `/scrape` is appended. */
@@ -95,16 +103,29 @@ export class FirecrawlFetchProvider implements WebFetchProvider {
   constructor(private readonly options: FirecrawlFetchProviderOptions) {}
 
   available(): boolean {
-    return ((this.options.apiKey?.length ?? 0) > 0 || this.options.resolveApiKey !== undefined)
-      && URL.canParse(this.options.baseURL)
-      && isPositiveInteger(this.options.maxContentChars)
+    const keyAvailable = this.options.keyPool?.available()
+      ?? ((this.options.apiKey?.length ?? 0) > 0 || this.options.resolveApiKey !== undefined)
+    return keyAvailable && URL.canParse(this.options.baseURL) && isPositiveInteger(this.options.maxContentChars)
   }
 
   async fetch(request: WebFetchRequest, signal?: AbortSignal): Promise<WebFetchResult> {
     throwIfFetchAborted(signal)
     validateFirecrawlUrl(request.url)
-    const apiKey = await this.apiKey(signal)
+    try {
+      if (this.options.keyPool !== undefined) {
+        return await this.options.keyPool.run((apiKey) => this.fetchWithApiKey(request, apiKey, signal))
+      }
+      return await this.fetchWithApiKey(request, await this.apiKey(signal), signal)
+    } catch (error: unknown) {
+      throw this.toWebError(error, signal)
+    }
+  }
 
+  private async fetchWithApiKey(
+    request: WebFetchRequest,
+    apiKey: string,
+    signal?: AbortSignal,
+  ): Promise<WebFetchResult> {
     let response: Response
     try {
       response = await fetch(`${this.options.baseURL}/scrape`, {
@@ -125,7 +146,7 @@ export class FirecrawlFetchProvider implements WebFetchProvider {
       })
     } catch (error: unknown) {
       if (signal?.aborted === true || isAbortError(error)) throw fetchAborted(signal, error)
-      throw new WebError(`Firecrawl fetch request failed: ${String(error)}`, 'WEB_PROVIDER_ERROR', { cause: error })
+      throw error
     }
 
     if (!response.ok) {
@@ -136,27 +157,40 @@ export class FirecrawlFetchProvider implements WebFetchProvider {
         const detail = parsed.error ?? parsed.message
         if (detail !== undefined && detail.length > 0) message = detail
       } catch (error: unknown) {
-        // An abort fired mid-body must surface as WEB_ABORTED, not be swallowed
-        // into a generic HTTP-error message — cancellation is not a provider
-        // error (the seam's cancellation contract).
         if (signal?.aborted === true || isAbortError(error)) throw fetchAborted(signal, error)
-        // Otherwise: the HTTP status is already captured in `message` above; a
-        // malformed/non-JSON error body can only cost a richer provider message.
       }
-      throw new WebError(message, 'WEB_PROVIDER_ERROR')
+      throw new FirecrawlHttpError(status, message)
     }
 
+    let payload: FirecrawlScrapeResponse
     try {
-      const payload = await response.json() as FirecrawlScrapeResponse
-      if (payload.success === false) {
-        throw new WebError(payload.error ?? 'Firecrawl scrape failed', 'WEB_PROVIDER_ERROR')
-      }
-      return mapFirecrawlResponse(payload, request.url, this.options.maxContentChars)
+      payload = await response.json() as FirecrawlScrapeResponse
     } catch (error: unknown) {
       if (signal?.aborted === true || isAbortError(error)) throw fetchAborted(signal, error)
-      if (error instanceof WebError) throw error
-      throw new WebError(`Firecrawl returned an unprocessable response body: ${String(error)}`, 'WEB_PROVIDER_ERROR', { cause: error })
+      throw new Error(`Firecrawl returned an unprocessable response body: ${String(error)}`, { cause: error })
     }
+    if (payload.success === false) {
+      throw new FirecrawlHttpError(response.status, payload.error ?? 'Firecrawl scrape failed')
+    }
+    return mapFirecrawlResponse(payload, request.url, this.options.maxContentChars)
+  }
+
+  private toWebError(error: unknown, signal?: AbortSignal): WebError {
+    if (error instanceof WebError) return error
+    if (error instanceof FirecrawlCredentialMissingError) {
+      return new WebError(
+        'Firecrawl fetch has no configured API key; store one through the credentials service or launch environment',
+        'WEB_PROVIDER_CREDENTIAL_MISSING',
+      )
+    }
+    if (error instanceof FirecrawlKeyPoolCooldownError) {
+      return new WebError('all configured Firecrawl API keys are cooling down', 'WEB_PROVIDER_ERROR')
+    }
+    if (error instanceof FirecrawlHttpError) {
+      return new WebError(`Firecrawl fetch request failed: ${error.message}`, 'WEB_PROVIDER_ERROR')
+    }
+    if (signal?.aborted === true || isAbortError(error)) return fetchAborted(signal, error)
+    return new WebError(`Firecrawl fetch request failed: ${String(error)}`, 'WEB_PROVIDER_ERROR', { cause: error })
   }
 
   /**

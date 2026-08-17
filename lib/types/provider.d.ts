@@ -7,6 +7,7 @@
  */
 import type { WebFetchProvider, WebFetchRequest, WebFetchResult } from '@deepseek-ai/dsh-web';
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials';
+import { FirecrawlApiKeyPool } from './key-pool.ts';
 import type { FirecrawlScrapeResponse } from './types.ts';
 /** Stable id this provider registers under. */
 export declare const FIRECRAWL_FETCH_PROVIDER_ID = "firecrawl";
@@ -20,6 +21,8 @@ export interface FirecrawlFetchProviderOptions {
     apiKey?: string;
     /** Resolve the current Firecrawl API key for one scrape operation. */
     resolveApiKey?: () => Promise<string | undefined>;
+    /** Shared pool used by the plugin when multiple account references are configured. */
+    keyPool?: FirecrawlApiKeyPool;
     /** Credential reference named by missing-credential diagnostics. */
     apiKeyEnv?: CredentialRef;
     /** Endpoint base; `/scrape` is appended. */
@@ -56,6 +59,8 @@ export declare class FirecrawlFetchProvider implements WebFetchProvider {
     constructor(options: FirecrawlFetchProviderOptions);
     available(): boolean;
     fetch(request: WebFetchRequest, signal?: AbortSignal): Promise<WebFetchResult>;
+    private fetchWithApiKey;
+    private toWebError;
     /**
      * Resolve one operation's credential without retaining it on the provider.
      * @param signal - abort signal for the surrounding fetch.

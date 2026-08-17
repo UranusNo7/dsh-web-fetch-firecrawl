@@ -36,3 +36,33 @@ export interface FirecrawlError {
     error?: string;
     message?: string;
 }
+/** One web result returned by Firecrawl Search. */
+export interface FirecrawlSearchItem {
+    /** Result URL. */
+    url: string;
+    /** Result title, when supplied. */
+    title?: string;
+    /** Search-result description. */
+    description?: string;
+    /** Search-result position, retained only for wire compatibility. */
+    position?: number;
+    /** Provider-supplied publication date, when supplied. */
+    publishedDate?: string;
+}
+/** Firecrawl Search response envelope. */
+export interface FirecrawlSearchResponse {
+    /** Whether Firecrawl completed the search. */
+    success?: boolean;
+    /** Search result groups; the provider consumes the `web` group. */
+    data?: {
+        web?: FirecrawlSearchItem[];
+    };
+    /** Provider error text on an unsuccessful response. */
+    error?: string;
+    /** Alternate provider error text. */
+    message?: string;
+    /** Credits consumed by the request, when returned by Firecrawl. */
+    creditsUsed?: number;
+    /** Firecrawl request id, when returned. */
+    id?: string;
+}
